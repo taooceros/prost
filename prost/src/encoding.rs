@@ -14,6 +14,7 @@ use core::str;
 use ::bytes::{Buf, BufMut, Bytes};
 
 use crate::error::DecodeErrorKind;
+use crate::transfer::{AsyncEncodeTarget, EncodePayload, PollEncodeState};
 use crate::DecodeError;
 use crate::Message;
 
@@ -563,6 +564,95 @@ pub mod string {
         buf.put_slice(value.as_bytes());
     }
 
+    pub fn encode_async<'a, S>(
+        tag: u32,
+        value: &'a String,
+        sink: &'a mut S,
+    ) -> impl core::future::Future<Output = Result<(), S::Error>> + Send + 'a + use<'a, S>
+    where
+        S: AsyncEncodeTarget + Send + 'a,
+    {
+        async move {
+            {
+                let mut buf = sink.buf_mut();
+                encode_key(tag, WireType::LengthDelimited, &mut buf);
+                encode_varint(value.len() as u64, &mut buf);
+            }
+            sink.write_payload(EncodePayload::from(value.as_bytes()))
+                .await
+        }
+    }
+
+    pub fn poll_encode<S>(
+        tag: u32,
+        value: &String,
+        sink: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), S::Error>>
+    where
+        S: AsyncEncodeTarget + Send,
+    {
+        if state.phase() == 0 {
+            let mut buf = sink.buf_mut();
+            encode_key(tag, WireType::LengthDelimited, &mut buf);
+            encode_varint(value.len() as u64, &mut buf);
+            state.set_phase(1);
+        }
+
+        match sink.poll_write_payload(
+            EncodePayload::from(value.as_bytes()),
+            state.payload_pin_mut(),
+            cx,
+        ) {
+            core::task::Poll::Ready(Ok(())) => {
+                state.set_phase(0);
+                core::task::Poll::Ready(Ok(()))
+            }
+            core::task::Poll::Ready(Err(error)) => core::task::Poll::Ready(Err(error)),
+            core::task::Poll::Pending => core::task::Poll::Pending,
+        }
+    }
+
+    pub fn poll_encode_repeated<S>(
+        tag: u32,
+        values: &[String],
+        sink: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), S::Error>>
+    where
+        S: AsyncEncodeTarget + Send,
+    {
+        while state.index() < values.len() {
+            let index = state.index();
+            match poll_encode(tag, &values[index], sink, state, cx) {
+                core::task::Poll::Ready(Ok(())) => state.set_index(index + 1),
+                core::task::Poll::Ready(Err(error)) => return core::task::Poll::Ready(Err(error)),
+                core::task::Poll::Pending => return core::task::Poll::Pending,
+            }
+        }
+
+        state.set_index(0);
+        core::task::Poll::Ready(Ok(()))
+    }
+
+    pub fn encode_repeated_async<'a, S>(
+        tag: u32,
+        values: &'a [String],
+        sink: &'a mut S,
+    ) -> impl core::future::Future<Output = Result<(), S::Error>> + Send + 'a + use<'a, S>
+    where
+        S: AsyncEncodeTarget + Send + 'a,
+    {
+        async move {
+            for value in values {
+                encode_async(tag, value, sink).await?;
+            }
+            Ok(())
+        }
+    }
+
     pub fn merge(
         wire_type: WireType,
         value: &mut String,
@@ -637,12 +727,13 @@ mod sealed {
     pub trait BytesAdapter: Default + Sized + 'static {
         fn len(&self) -> usize;
 
+        fn as_slice(&self) -> &[u8];
+
         /// Replace contents of this buffer with the contents of another buffer.
         fn replace_with(&mut self, buf: impl Buf);
 
         /// Appends this buffer to the (contents of) other buffer.
         fn append_to(&self, buf: &mut impl BufMut);
-
         fn is_empty(&self) -> bool {
             self.len() == 0
         }
@@ -654,6 +745,10 @@ impl BytesAdapter for Bytes {}
 impl sealed::BytesAdapter for Bytes {
     fn len(&self) -> usize {
         Buf::remaining(self)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.as_ref()
     }
 
     fn replace_with(&mut self, mut buf: impl Buf) {
@@ -670,6 +765,10 @@ impl BytesAdapter for Vec<u8> {}
 impl sealed::BytesAdapter for Vec<u8> {
     fn len(&self) -> usize {
         Vec::len(self)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.as_slice()
     }
 
     fn replace_with(&mut self, buf: impl Buf) {
@@ -692,6 +791,99 @@ pub mod bytes {
         encode_key(tag, WireType::LengthDelimited, buf);
         encode_varint(value.len() as u64, buf);
         value.append_to(buf);
+    }
+
+    pub fn encode_async<'a, T, S>(
+        tag: u32,
+        value: &'a T,
+        sink: &'a mut S,
+    ) -> impl core::future::Future<Output = Result<(), S::Error>> + Send + 'a + use<'a, T, S>
+    where
+        T: BytesAdapter + Sync + 'a,
+        S: AsyncEncodeTarget + Send + 'a,
+    {
+        async move {
+            {
+                let mut buf = sink.buf_mut();
+                encode_key(tag, WireType::LengthDelimited, &mut buf);
+                encode_varint(value.len() as u64, &mut buf);
+            }
+            sink.write_payload(EncodePayload::from(value.as_slice()))
+                .await
+        }
+    }
+
+    pub fn poll_encode<T, S>(
+        tag: u32,
+        value: &T,
+        sink: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), S::Error>>
+    where
+        T: BytesAdapter + Sync,
+        S: AsyncEncodeTarget + Send,
+    {
+        if state.phase() == 0 {
+            let mut buf = sink.buf_mut();
+            encode_key(tag, WireType::LengthDelimited, &mut buf);
+            encode_varint(value.len() as u64, &mut buf);
+            state.set_phase(1);
+        }
+
+        match sink.poll_write_payload(
+            EncodePayload::from(value.as_slice()),
+            state.payload_pin_mut(),
+            cx,
+        ) {
+            core::task::Poll::Ready(Ok(())) => {
+                state.set_phase(0);
+                core::task::Poll::Ready(Ok(()))
+            }
+            core::task::Poll::Ready(Err(error)) => core::task::Poll::Ready(Err(error)),
+            core::task::Poll::Pending => core::task::Poll::Pending,
+        }
+    }
+
+    pub fn poll_encode_repeated<T, S>(
+        tag: u32,
+        values: &[T],
+        sink: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), S::Error>>
+    where
+        T: BytesAdapter + Sync,
+        S: AsyncEncodeTarget + Send,
+    {
+        while state.index() < values.len() {
+            let index = state.index();
+            match poll_encode(tag, &values[index], sink, state, cx) {
+                core::task::Poll::Ready(Ok(())) => state.set_index(index + 1),
+                core::task::Poll::Ready(Err(error)) => return core::task::Poll::Ready(Err(error)),
+                core::task::Poll::Pending => return core::task::Poll::Pending,
+            }
+        }
+
+        state.set_index(0);
+        core::task::Poll::Ready(Ok(()))
+    }
+
+    pub fn encode_repeated_async<'a, T, S>(
+        tag: u32,
+        values: &'a [T],
+        sink: &'a mut S,
+    ) -> impl core::future::Future<Output = Result<(), S::Error>> + Send + 'a + use<'a, T, S>
+    where
+        T: BytesAdapter + Sync + 'a,
+        S: AsyncEncodeTarget + Send + 'a,
+    {
+        async move {
+            for value in values {
+                encode_async(tag, value, sink).await?;
+            }
+            Ok(())
+        }
     }
 
     pub fn merge(
@@ -794,6 +986,80 @@ pub mod message {
         msg.encode_raw(buf);
     }
 
+    pub fn encode_async<'a, M, S>(
+        tag: u32,
+        msg: &'a M,
+        sink: &'a mut S,
+    ) -> impl core::future::Future<Output = Result<(), S::Error>> + Send + 'a + use<'a, M, S>
+    where
+        M: Message + 'a,
+        S: AsyncEncodeTarget + Send + 'a,
+    {
+        async move {
+            {
+                let mut buf = sink.buf_mut();
+                encode_key(tag, WireType::LengthDelimited, &mut buf);
+                encode_varint(msg.encoded_len() as u64, &mut buf);
+            }
+            msg.encode_raw_async(sink).await
+        }
+    }
+
+    pub fn poll_encode<S, M>(
+        tag: u32,
+        msg: &M,
+        sink: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), S::Error>>
+    where
+        S: AsyncEncodeTarget + Send,
+        M: Message,
+    {
+        poll_encode_with_phases(tag, msg, sink, state, cx, 0, 1, 0)
+    }
+
+    pub fn poll_encode_with_phases<S, M>(
+        tag: u32,
+        msg: &M,
+        sink: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut core::task::Context<'_>,
+        start_phase: u8,
+        nested_phase: u8,
+        next_phase: u8,
+    ) -> core::task::Poll<Result<(), S::Error>>
+    where
+        S: AsyncEncodeTarget + Send,
+        M: Message,
+    {
+        if state.phase() == start_phase {
+            {
+                let mut buf = sink.buf_mut();
+                encode_key(tag, WireType::LengthDelimited, &mut buf);
+                encode_varint(msg.encoded_len() as u64, &mut buf);
+            }
+            state.set_phase(nested_phase);
+        }
+
+        state.enter_nested();
+        match msg.poll_encode_raw(sink, state, cx) {
+            core::task::Poll::Ready(Ok(())) => {
+                state.leave_nested_ready();
+                state.set_phase(next_phase);
+                core::task::Poll::Ready(Ok(()))
+            }
+            core::task::Poll::Ready(Err(error)) => {
+                state.leave_nested_ready();
+                core::task::Poll::Ready(Err(error))
+            }
+            core::task::Poll::Pending => {
+                state.leave_nested_pending();
+                core::task::Poll::Pending
+            }
+        }
+    }
+
     pub fn merge<M, B>(
         wire_type: WireType,
         msg: &mut M,
@@ -824,6 +1090,47 @@ pub mod message {
         for msg in messages {
             encode(tag, msg, buf);
         }
+    }
+
+    pub fn encode_repeated_async<'a, M, S>(
+        tag: u32,
+        messages: &'a [M],
+        sink: &'a mut S,
+    ) -> impl core::future::Future<Output = Result<(), S::Error>> + Send + 'a + use<'a, M, S>
+    where
+        M: Message + 'a,
+        S: AsyncEncodeTarget + Send + 'a,
+    {
+        async move {
+            for msg in messages {
+                encode_async(tag, msg, sink).await?;
+            }
+            Ok(())
+        }
+    }
+
+    pub fn poll_encode_repeated<S, M>(
+        tag: u32,
+        messages: &[M],
+        sink: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), S::Error>>
+    where
+        S: AsyncEncodeTarget + Send,
+        M: Message,
+    {
+        while state.index() < messages.len() {
+            let index = state.index();
+            match poll_encode(tag, &messages[index], sink, state, cx) {
+                core::task::Poll::Ready(Ok(())) => state.set_index(index + 1),
+                core::task::Poll::Ready(Err(error)) => return core::task::Poll::Ready(Err(error)),
+                core::task::Poll::Pending => return core::task::Poll::Pending,
+            }
+        }
+
+        state.set_index(0);
+        core::task::Poll::Ready(Ok(()))
     }
 
     pub fn merge_repeated<M>(
@@ -879,6 +1186,29 @@ pub mod group {
         encode_key(tag, WireType::EndGroup, buf);
     }
 
+    pub fn encode_async<'a, M, S>(
+        tag: u32,
+        msg: &'a M,
+        sink: &'a mut S,
+    ) -> impl core::future::Future<Output = Result<(), S::Error>> + Send + 'a + use<'a, M, S>
+    where
+        M: Message + 'a,
+        S: AsyncEncodeTarget + Send + 'a,
+    {
+        async move {
+            {
+                let mut buf = sink.buf_mut();
+                encode_key(tag, WireType::StartGroup, &mut buf);
+            }
+            msg.encode_raw_async(sink).await?;
+            {
+                let mut buf = sink.buf_mut();
+                encode_key(tag, WireType::EndGroup, &mut buf);
+            }
+            Ok(())
+        }
+    }
+
     pub fn merge<M>(
         tag: u32,
         wire_type: WireType,
@@ -911,6 +1241,23 @@ pub mod group {
     {
         for msg in messages {
             encode(tag, msg, buf);
+        }
+    }
+
+    pub fn encode_repeated_async<'a, M, S>(
+        tag: u32,
+        messages: &'a [M],
+        sink: &'a mut S,
+    ) -> impl core::future::Future<Output = Result<(), S::Error>> + Send + 'a + use<'a, M, S>
+    where
+        M: Message + 'a,
+        S: AsyncEncodeTarget + Send + 'a,
+    {
+        async move {
+            for msg in messages {
+                encode_async(tag, msg, sink).await?;
+            }
+            Ok(())
         }
     }
 

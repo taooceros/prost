@@ -176,6 +176,255 @@ impl Field {
         }
     }
 
+    /// Returns a statement which asynchronously encodes the map field.
+    pub fn encode_async(&self, prost_path: &Path, ident: TokenStream) -> TokenStream {
+        if !self.needs_async_encode() {
+            let encode = self.encode(prost_path, ident);
+            return quote! {
+                {
+                    let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                    let buf = &mut buf;
+                    #encode
+                }
+            };
+        }
+
+        let tag = self.tag;
+        let key_ty = self.key_ty.rust_type(prost_path);
+        let key_len = {
+            let key_mod = self.key_ty.module();
+            quote!(#prost_path::encoding::#key_mod::encoded_len)
+        };
+        let key_encode =
+            scalar::encode_value_async(prost_path, &self.key_ty, quote!(1), quote!(key));
+
+        let (val_len, skip_val, val_encode) = match &self.value_ty {
+            ValueTy::Scalar(scalar::Ty::Enumeration(ty)) => (
+                quote!(#prost_path::encoding::int32::encoded_len),
+                quote! {
+                    let val_default: i32 = #ty::default() as i32;
+                    let skip_val = val == &val_default;
+                },
+                quote! {
+                    {
+                        let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                        #prost_path::encoding::int32::encode(2, val, &mut buf);
+                    }
+                },
+            ),
+            ValueTy::Scalar(value_ty) => {
+                let val_mod = value_ty.module();
+                let val_ty = value_ty.rust_type(prost_path);
+                (
+                    quote!(#prost_path::encoding::#val_mod::encoded_len),
+                    quote! {
+                        let val_default: #val_ty = ::core::default::Default::default();
+                        let skip_val = val == &val_default;
+                    },
+                    scalar::encode_value_async(prost_path, value_ty, quote!(2), quote!(val)),
+                )
+            }
+            ValueTy::Message => (
+                quote!(#prost_path::encoding::message::encoded_len),
+                quote! {
+                    let skip_val = #prost_path::Message::encoded_len(val) == 0;
+                },
+                quote! {
+                    {
+                        let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                        #prost_path::encoding::message::encode(2, val, &mut buf);
+                    }
+                },
+            ),
+        };
+
+        quote! {
+            for (key, val) in #ident.iter() {
+                let key_default: #key_ty = ::core::default::Default::default();
+                let skip_key = key == &key_default;
+                #skip_val
+
+                let len =
+                    (if skip_key { 0 } else { #key_len(1, key) })
+                    + (if skip_val { 0 } else { #val_len(2, val) });
+
+                {
+                    let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                    #prost_path::encoding::encode_key(
+                        #tag,
+                        #prost_path::encoding::WireType::LengthDelimited,
+                        &mut buf,
+                    );
+                    #prost_path::encoding::encode_varint(len as u64, &mut buf);
+                }
+                if !skip_key {
+                    #key_encode
+                }
+                if !skip_val {
+                    #val_encode
+                }
+            }
+        }
+    }
+
+    pub fn poll_encode(&self, prost_path: &Path, ident: TokenStream, index: usize) -> TokenStream {
+        if !self.needs_async_encode() {
+            let encode = self.encode(prost_path, ident);
+            return quote! {
+                if state.field() == #index {
+                    {
+                        let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                        let buf = &mut buf;
+                        #encode
+                    }
+                    state.advance_field();
+                }
+            };
+        }
+
+        let tag = self.tag;
+        let key_ty = self.key_ty.rust_type(prost_path);
+        let key_len = {
+            let key_mod = self.key_ty.module();
+            quote!(#prost_path::encoding::#key_mod::encoded_len)
+        };
+        let key_start = scalar::poll_encode_payload_value(
+            prost_path,
+            &self.key_ty,
+            quote!(1),
+            quote!(key),
+            2,
+            3,
+        );
+        let key_pending =
+            scalar::poll_pending_payload_value(prost_path, &self.key_ty, quote!(key), 3);
+
+        let (val_len, skip_val, val_start, val_pending) = match &self.value_ty {
+            ValueTy::Scalar(scalar::Ty::Enumeration(ty)) => (
+                quote!(#prost_path::encoding::int32::encoded_len),
+                quote! {
+                    let val_default: i32 = #ty::default() as i32;
+                    let skip_val = val == &val_default;
+                },
+                quote! {
+                    {
+                        let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                        #prost_path::encoding::int32::encode(2, val, &mut buf);
+                    }
+                    state.set_phase(5);
+                },
+                quote! {},
+            ),
+            ValueTy::Scalar(value_ty) => {
+                let val_mod = value_ty.module();
+                let val_ty = value_ty.rust_type(prost_path);
+                (
+                    quote!(#prost_path::encoding::#val_mod::encoded_len),
+                    quote! {
+                        let val_default: #val_ty = ::core::default::Default::default();
+                        let skip_val = val == &val_default;
+                    },
+                    scalar::poll_encode_payload_value(
+                        prost_path,
+                        value_ty,
+                        quote!(2),
+                        quote!(val),
+                        4,
+                        5,
+                    ),
+                    scalar::poll_pending_payload_value(prost_path, value_ty, quote!(val), 5),
+                )
+            }
+            ValueTy::Message => {
+                let poll_value = quote! {
+                    match #prost_path::encoding::message::poll_encode_with_phases(2, val, sink, state, cx, 3, 4, 5) {
+                        ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {}
+                        ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                            return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                        }
+                        ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+                    }
+                };
+                (
+                    quote!(#prost_path::encoding::message::encoded_len),
+                    quote! {
+                        let skip_val = #prost_path::Message::encoded_len(val) == 0;
+                    },
+                    poll_value.clone(),
+                    poll_value,
+                )
+            }
+        };
+
+        quote! {
+            if state.field() == #index {
+                let mut __prost_entry_index = 0usize;
+                for (key, val) in #ident.iter() {
+                    if __prost_entry_index < state.index() {
+                        __prost_entry_index += 1;
+                        continue;
+                    }
+
+                    let key_default: #key_ty = ::core::default::Default::default();
+                    let skip_key = key == &key_default;
+                    #skip_val
+
+                    if state.phase() == 0 {
+                        let len =
+                            (if skip_key { 0 } else { #key_len(1, key) })
+                            + (if skip_val { 0 } else { #val_len(2, val) });
+                        {
+                            let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                            #prost_path::encoding::encode_key(
+                                #tag,
+                                #prost_path::encoding::WireType::LengthDelimited,
+                                &mut buf,
+                            );
+                            #prost_path::encoding::encode_varint(len as u64, &mut buf);
+                        }
+                        state.set_phase(1);
+                    }
+
+                    if state.phase() == 1 {
+                        if !skip_key {
+                            #key_start
+                        } else {
+                            state.set_phase(3);
+                        }
+                    }
+                    if state.phase() == 2 {
+                        #key_pending
+                    }
+
+                    if state.phase() == 3 {
+                        if !skip_val {
+                            #val_start
+                        } else {
+                            state.set_phase(5);
+                        }
+                    }
+                    if state.phase() == 4 {
+                        #val_pending
+                    }
+
+                    state.set_index(state.index() + 1);
+                    state.set_phase(0);
+                    __prost_entry_index += 1;
+                }
+
+                state.advance_field();
+            }
+        }
+    }
+
+    pub fn needs_async_encode(&self) -> bool {
+        matches!(&self.key_ty, scalar::Ty::String)
+            || matches!(
+                &self.value_ty,
+                ValueTy::Scalar(scalar::Ty::String | scalar::Ty::Bytes(..)) | ValueTy::Message
+            )
+    }
+
     /// Returns an expression which evaluates to the result of merging a decoded key value pair
     /// into the map.
     pub fn merge(&self, prost_path: &Path, ident: TokenStream) -> TokenStream {

@@ -68,6 +68,39 @@ impl Field {
         }
     }
 
+    /// Returns a statement which asynchronously encodes the oneof field.
+    pub fn encode_async(&self, ident: TokenStream) -> TokenStream {
+        quote! {
+            if let Some(ref oneof) = #ident {
+                oneof.encode_async(sink).await?;
+            }
+        }
+    }
+
+    pub fn poll_encode(&self, _prost_path: &Path, ident: TokenStream, index: usize) -> TokenStream {
+        quote! {
+            if state.field() == #index {
+                if let Some(ref oneof) = #ident {
+                    state.enter_nested();
+                    match oneof.poll_encode(sink, state, cx) {
+                        ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {
+                            state.leave_nested_ready();
+                        }
+                        ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                            state.leave_nested_ready();
+                            return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                        }
+                        ::core::task::Poll::Pending => {
+                            state.leave_nested_pending();
+                            return ::core::task::Poll::Pending;
+                        }
+                    }
+                }
+                state.advance_field();
+            }
+        }
+    }
+
     /// Returns an expression which evaluates to the result of decoding the oneof field.
     pub fn merge(&self, ident: TokenStream) -> TokenStream {
         let ty = &self.ty;

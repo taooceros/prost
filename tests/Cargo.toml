@@ -8,6 +8,7 @@ authors.workspace = true
 [features]
 default = ["std"]
 std = []
+hardware-dsa = ["std", "dep:idxd-rust"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("edition-2015"))'] }
@@ -15,6 +16,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("edition-2
 [dependencies]
 anyhow = "1.0.1"
 cfg-if = "1"
+idxd-rust = { path = "../../../../idxd-rust", optional = true }
 prost = { path = "../prost" }
 prost-types = { path = "../prost-types" }
 

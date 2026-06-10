@@ -169,12 +169,44 @@ fn try_message(input: TokenStream) -> Result<TokenStream, Error> {
         }
     };
 
+    let poll_encode_raw = if fields.iter().any(|(_, field)| field.needs_async_encode()) {
+        let poll_encode = fields
+            .iter()
+            .enumerate()
+            .map(|(index, (field_ident, field))| {
+                field.poll_encode(&prost_path, quote!(self.#field_ident), index)
+            });
+
+        quote! {
+            #[allow(unused_variables)]
+            fn poll_encode_raw<S>(
+                &self,
+                target: &mut S,
+                state: &mut #prost_path::transfer::PollEncodeState<S>,
+                cx: &mut ::core::task::Context<'_>,
+            ) -> ::core::task::Poll<::core::result::Result<(), S::Error>>
+            where
+                Self: Sized,
+                S: #prost_path::transfer::AsyncEncodeTarget + Send,
+            {
+                let sink = target;
+                #(#poll_encode)*
+                state.clear();
+                ::core::task::Poll::Ready(::core::result::Result::Ok(()))
+            }
+        }
+    } else {
+        quote!()
+    };
+
     let expanded = quote! {
         impl #impl_generics #prost_path::Message for #ident #ty_generics #where_clause {
             #[allow(unused_variables)]
             fn encode_raw(&self, buf: &mut impl #prost_path::bytes::BufMut) {
                 #(#encode)*
             }
+
+            #poll_encode_raw
 
             #[allow(unused_variables)]
             fn merge_field(
@@ -438,6 +470,30 @@ fn try_oneof(input: TokenStream) -> Result<TokenStream, Error> {
         let encode = field.encode(&prost_path, quote!(*value));
         quote!(#deprecated #ident::#variant_ident(ref value) => { #encode })
     });
+    let encode_async_body = if fields
+        .iter()
+        .any(|(_, field, _)| field.needs_async_encode())
+    {
+        let encode_async = fields.iter().map(|(variant_ident, field, deprecated)| {
+            let encode = field.encode_async(&prost_path, quote!(*value));
+            quote!(#deprecated #ident::#variant_ident(ref value) => { #encode })
+        });
+
+        quote! {
+            match *self {
+                #(#encode_async,)*
+            }
+        }
+    } else {
+        quote! {
+            let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+            self.encode(&mut buf);
+        }
+    };
+    let poll_encode = fields.iter().map(|(variant_ident, field, deprecated)| {
+        let encode = field.poll_encode(&prost_path, quote!(*value), 0);
+        quote!(#deprecated #ident::#variant_ident(ref value) => { #encode })
+    });
 
     let merge = fields.iter().map(|(variant_ident, field, deprecated)| {
         let tag = field.tags()[0];
@@ -466,6 +522,35 @@ fn try_oneof(input: TokenStream) -> Result<TokenStream, Error> {
                 match *self {
                     #(#encode,)*
                 }
+            }
+
+            /// Asynchronously encodes the message to a target.
+            pub async fn encode_async<S>(&self, target: &mut S) -> ::core::result::Result<(), S::Error>
+            where
+                S: #prost_path::transfer::AsyncEncodeTarget + Send,
+            {
+                let sink = target;
+                #encode_async_body
+                ::core::result::Result::Ok(())
+            }
+
+            /// Polls asynchronous encoding of this oneof into a target.
+            #[allow(unused_variables)]
+            pub fn poll_encode<S>(
+                &self,
+                target: &mut S,
+                state: &mut #prost_path::transfer::PollEncodeState<S>,
+                cx: &mut ::core::task::Context<'_>,
+            ) -> ::core::task::Poll<::core::result::Result<(), S::Error>>
+            where
+                S: #prost_path::transfer::AsyncEncodeTarget + Send,
+            {
+                let sink = target;
+                match *self {
+                    #(#poll_encode,)*
+                }
+                state.clear();
+                ::core::task::Poll::Ready(::core::result::Result::Ok(()))
             }
 
             /// Decodes an instance of the message from a buffer, and merges it into self.

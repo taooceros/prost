@@ -9,13 +9,16 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use ::bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes};
+use core::task::{Context, Poll};
 
 use crate::encoding::wire_type::WireType;
 use crate::{
     encoding::{
-        bool, bytes, double, float, int32, int64, skip_field, string, uint32, uint64, DecodeContext,
+        bool, bytes as encoding_bytes, double, float, int32, int64, skip_field, string, uint32,
+        uint64, DecodeContext,
     },
+    transfer::{AsyncEncodeTarget, PollEncodeState},
     DecodeError, Message, Name,
 };
 
@@ -320,6 +323,26 @@ impl Message for String {
             string::encode(1, self, buf)
         }
     }
+    fn poll_encode_raw<S>(
+        &self,
+        sink: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), S::Error>>
+    where
+        Self: Sized,
+        S: AsyncEncodeTarget + Send,
+    {
+        if !self.is_empty() {
+            match string::poll_encode(1, self, sink, state, cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        state.clear();
+        Poll::Ready(Ok(()))
+    }
     fn merge_field(
         &mut self,
         tag: u32,
@@ -359,8 +382,28 @@ impl Name for String {
 impl Message for Vec<u8> {
     fn encode_raw(&self, buf: &mut impl BufMut) {
         if !self.is_empty() {
-            bytes::encode(1, self, buf)
+            encoding_bytes::encode(1, self, buf)
         }
+    }
+    fn poll_encode_raw<S>(
+        &self,
+        sink: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), S::Error>>
+    where
+        Self: Sized,
+        S: AsyncEncodeTarget + Send,
+    {
+        if !self.is_empty() {
+            match encoding_bytes::poll_encode(1, self, sink, state, cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        state.clear();
+        Poll::Ready(Ok(()))
     }
     fn merge_field(
         &mut self,
@@ -370,14 +413,14 @@ impl Message for Vec<u8> {
         ctx: DecodeContext,
     ) -> Result<(), DecodeError> {
         if tag == 1 {
-            bytes::merge(wire_type, self, buf, ctx)
+            encoding_bytes::merge(wire_type, self, buf, ctx)
         } else {
             skip_field(wire_type, tag, buf, ctx)
         }
     }
     fn encoded_len(&self) -> usize {
         if !self.is_empty() {
-            bytes::encoded_len(1, self)
+            encoding_bytes::encoded_len(1, self)
         } else {
             0
         }
@@ -401,8 +444,28 @@ impl Name for Vec<u8> {
 impl Message for Bytes {
     fn encode_raw(&self, buf: &mut impl BufMut) {
         if !self.is_empty() {
-            bytes::encode(1, self, buf)
+            encoding_bytes::encode(1, self, buf)
         }
+    }
+    fn poll_encode_raw<S>(
+        &self,
+        sink: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), S::Error>>
+    where
+        Self: Sized,
+        S: AsyncEncodeTarget + Send,
+    {
+        if !self.is_empty() {
+            match encoding_bytes::poll_encode(1, self, sink, state, cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        state.clear();
+        Poll::Ready(Ok(()))
     }
     fn merge_field(
         &mut self,
@@ -412,14 +475,14 @@ impl Message for Bytes {
         ctx: DecodeContext,
     ) -> Result<(), DecodeError> {
         if tag == 1 {
-            bytes::merge(wire_type, self, buf, ctx)
+            encoding_bytes::merge(wire_type, self, buf, ctx)
         } else {
             skip_field(wire_type, tag, buf, ctx)
         }
     }
     fn encoded_len(&self) -> usize {
         if !self.is_empty() {
-            bytes::encoded_len(1, self)
+            encoding_bytes::encoded_len(1, self)
         } else {
             0
         }

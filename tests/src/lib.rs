@@ -41,6 +41,8 @@ mod enum_keyword_variant;
 #[cfg(test)]
 mod generic_derive;
 #[cfg(test)]
+mod hardware_dsa;
+#[cfg(test)]
 mod message_encoding;
 #[cfg(test)]
 mod no_shadowed_types;

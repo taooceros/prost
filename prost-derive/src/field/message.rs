@@ -90,6 +90,58 @@ impl Field {
         }
     }
 
+    pub fn encode_async(&self, prost_path: &Path, ident: TokenStream) -> TokenStream {
+        let encode = self.encode(prost_path, ident);
+        quote! {
+            {
+                let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                let buf = &mut buf;
+                #encode
+            }
+        }
+    }
+
+    pub fn poll_encode(&self, prost_path: &Path, ident: TokenStream, index: usize) -> TokenStream {
+        let tag = self.tag;
+        let body = match self.label {
+            Label::Optional => quote! {
+                if let Some(ref msg) = #ident {
+                    match #prost_path::encoding::message::poll_encode(#tag, msg, sink, state, cx) {
+                        ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {}
+                        ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                            return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                        }
+                        ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+                    }
+                }
+            },
+            Label::Required => quote! {
+                match #prost_path::encoding::message::poll_encode(#tag, &#ident, sink, state, cx) {
+                    ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {}
+                    ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                        return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                    }
+                    ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+                }
+            },
+            Label::Repeated => quote! {
+                match #prost_path::encoding::message::poll_encode_repeated(#tag, &#ident, sink, state, cx) {
+                    ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {}
+                    ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                        return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                    }
+                    ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+                }
+            },
+        };
+        quote! {
+            if state.field() == #index {
+                #body
+                state.advance_field();
+            }
+        }
+    }
+
     pub fn merge(&self, prost_path: &Path, ident: TokenStream) -> TokenStream {
         match self.label {
             Label::Optional => quote! {

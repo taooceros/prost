@@ -135,6 +135,134 @@ impl Field {
         }
     }
 
+    pub fn encode_async(&self, prost_path: &Path, ident: TokenStream) -> TokenStream {
+        if !self.needs_async_encode() {
+            let encode = self.encode(prost_path, ident);
+            return quote! {
+                {
+                    let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                    let buf = &mut buf;
+                    #encode
+                }
+            };
+        }
+
+        let tag = self.tag;
+
+        match self.kind {
+            Kind::Plain(ref default) => {
+                let default = default.typed();
+                let encode =
+                    encode_value_async(prost_path, &self.ty, quote!(#tag), quote!(&#ident));
+                quote! {
+                    if #ident != #default {
+                        #encode
+                    }
+                }
+            }
+            Kind::Optional(..) => {
+                let encode = encode_value_async(prost_path, &self.ty, quote!(#tag), quote!(value));
+                quote! {
+                    if let ::core::option::Option::Some(ref value) = #ident {
+                        #encode
+                    }
+                }
+            }
+            Kind::Required(..) => {
+                encode_value_async(prost_path, &self.ty, quote!(#tag), quote!(&#ident))
+            }
+            Kind::Repeated => {
+                let module = self.ty.module();
+                quote! {
+                    #prost_path::encoding::#module::encode_repeated_async(#tag, &#ident, sink).await?;
+                }
+            }
+            Kind::Packed => {
+                let encode = self.encode(prost_path, ident);
+                quote! {
+                    {
+                        let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                        let buf = &mut buf;
+                        #encode
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn poll_encode(&self, prost_path: &Path, ident: TokenStream, index: usize) -> TokenStream {
+        if !self.needs_async_encode() {
+            let encode = self.encode(prost_path, ident);
+            return quote! {
+                if state.field() == #index {
+                    {
+                        let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                        let buf = &mut buf;
+                        #encode
+                    }
+                    state.advance_field();
+                }
+            };
+        }
+
+        let tag = self.tag;
+        let body = match self.kind {
+            Kind::Plain(ref default) => {
+                let default = default.typed();
+                let encode = poll_encode_value(prost_path, &self.ty, quote!(#tag), quote!(&#ident));
+                quote! {
+                    if #ident != #default {
+                        #encode
+                    }
+                }
+            }
+            Kind::Optional(..) => {
+                let encode = poll_encode_value(prost_path, &self.ty, quote!(#tag), quote!(value));
+                quote! {
+                    if let ::core::option::Option::Some(ref value) = #ident {
+                        #encode
+                    }
+                }
+            }
+            Kind::Required(..) => {
+                poll_encode_value(prost_path, &self.ty, quote!(#tag), quote!(&#ident))
+            }
+            Kind::Repeated => {
+                let module = self.ty.module();
+                quote! {
+                    match #prost_path::encoding::#module::poll_encode_repeated(#tag, &#ident, sink, state, cx) {
+                        ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {}
+                        ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                            return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                        }
+                        ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+                    }
+                }
+            }
+            Kind::Packed => {
+                let encode = self.encode(prost_path, ident);
+                quote! {
+                    {
+                        let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                        let buf = &mut buf;
+                        #encode
+                    }
+                }
+            }
+        };
+
+        quote! {
+            if state.field() == #index {
+                #body
+                state.advance_field();
+            }
+        }
+    }
+
+    pub fn needs_async_encode(&self) -> bool {
+        matches!(&self.ty, Ty::String | Ty::Bytes(..))
+    }
+
     /// Returns an expression which evaluates to the result of merging a decoded
     /// scalar value into the field.
     pub fn merge(&self, prost_path: &Path, ident: TokenStream) -> TokenStream {
@@ -515,6 +643,7 @@ impl Ty {
             Ty::Sint64 => "sint64",
             Ty::Fixed32 => "fixed32",
             Ty::Fixed64 => "fixed64",
+
             Ty::Sfixed32 => "sfixed32",
             Ty::Sfixed64 => "sfixed64",
             Ty::Bool => "bool",
@@ -565,6 +694,183 @@ impl Ty {
     /// Returns false if the scalar type is length delimited (i.e., `string` or `bytes`).
     pub fn is_numeric(&self) -> bool {
         !matches!(self, Ty::String | Ty::Bytes(..))
+    }
+}
+
+pub(crate) fn encode_value_async(
+    prost_path: &Path,
+    ty: &Ty,
+    tag: TokenStream,
+    value: TokenStream,
+) -> TokenStream {
+    let module = ty.module();
+    match ty {
+        Ty::String | Ty::Bytes(..) => quote! {
+            #prost_path::encoding::#module::encode_async(#tag, #value, sink).await?;
+        },
+        _ => quote! {
+            {
+                let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                #prost_path::encoding::#module::encode(#tag, #value, &mut buf);
+            }
+        },
+    }
+}
+
+pub(crate) fn poll_encode_value(
+    prost_path: &Path,
+    ty: &Ty,
+    tag: TokenStream,
+    value: TokenStream,
+) -> TokenStream {
+    let module = ty.module();
+    match ty {
+        Ty::String | Ty::Bytes(..) => quote! {
+            match #prost_path::encoding::#module::poll_encode(#tag, #value, sink, state, cx) {
+                ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {}
+                ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                    return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                }
+                ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+            }
+        },
+        _ => quote! {
+            {
+                let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                #prost_path::encoding::#module::encode(#tag, #value, &mut buf);
+            }
+        },
+    }
+}
+
+pub(crate) fn poll_encode_payload_value(
+    prost_path: &Path,
+    ty: &Ty,
+    tag: TokenStream,
+    value: TokenStream,
+    pending_phase: u8,
+    next_phase: u8,
+) -> TokenStream {
+    match ty {
+        Ty::String => quote! {
+            {
+                let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                #prost_path::encoding::encode_key(
+                    #tag,
+                    #prost_path::encoding::WireType::LengthDelimited,
+                    &mut buf,
+                );
+                #prost_path::encoding::encode_varint(#value.len() as u64, &mut buf);
+            }
+            state.set_phase(#pending_phase);
+            match sink.poll_write_payload(#prost_path::transfer::EncodePayload::from(#value.as_bytes()), state.payload_pin_mut(), cx) {
+                ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {
+                    state.set_phase(#next_phase);
+                }
+                ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                    return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                }
+                ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+            }
+        },
+        Ty::Bytes(BytesTy::Vec) => quote! {
+            {
+                let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                #prost_path::encoding::encode_key(
+                    #tag,
+                    #prost_path::encoding::WireType::LengthDelimited,
+                    &mut buf,
+                );
+                #prost_path::encoding::encode_varint(#value.len() as u64, &mut buf);
+            }
+            state.set_phase(#pending_phase);
+            match sink.poll_write_payload(#prost_path::transfer::EncodePayload::from(#value.as_slice()), state.payload_pin_mut(), cx) {
+                ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {
+                    state.set_phase(#next_phase);
+                }
+                ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                    return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                }
+                ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+            }
+        },
+        Ty::Bytes(BytesTy::Bytes) => quote! {
+            {
+                let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                #prost_path::encoding::encode_key(
+                    #tag,
+                    #prost_path::encoding::WireType::LengthDelimited,
+                    &mut buf,
+                );
+                #prost_path::encoding::encode_varint(#value.len() as u64, &mut buf);
+            }
+            state.set_phase(#pending_phase);
+            match sink.poll_write_payload(#prost_path::transfer::EncodePayload::from(#value.as_ref()), state.payload_pin_mut(), cx) {
+                ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {
+                    state.set_phase(#next_phase);
+                }
+                ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                    return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                }
+                ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+            }
+        },
+        _ => {
+            let module = ty.module();
+            quote! {
+                {
+                    let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                    #prost_path::encoding::#module::encode(#tag, #value, &mut buf);
+                }
+                state.set_phase(#next_phase);
+            }
+        }
+    }
+}
+
+pub(crate) fn poll_pending_payload_value(
+    prost_path: &Path,
+    ty: &Ty,
+    value: TokenStream,
+    next_phase: u8,
+) -> TokenStream {
+    match ty {
+        Ty::String => quote! {
+            match sink.poll_write_payload(#prost_path::transfer::EncodePayload::from(#value.as_bytes()), state.payload_pin_mut(), cx) {
+                ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {
+                    state.set_phase(#next_phase);
+                }
+                ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                    return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                }
+                ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+            }
+        },
+        Ty::Bytes(BytesTy::Vec) => quote! {
+            match sink.poll_write_payload(#prost_path::transfer::EncodePayload::from(#value.as_slice()), state.payload_pin_mut(), cx) {
+                ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {
+                    state.set_phase(#next_phase);
+                }
+                ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                    return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                }
+                ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+            }
+        },
+        Ty::Bytes(BytesTy::Bytes) => quote! {
+            match sink.poll_write_payload(#prost_path::transfer::EncodePayload::from(#value.as_ref()), state.payload_pin_mut(), cx) {
+                ::core::task::Poll::Ready(::core::result::Result::Ok(())) => {
+                    state.set_phase(#next_phase);
+                }
+                ::core::task::Poll::Ready(::core::result::Result::Err(error)) => {
+                    return ::core::task::Poll::Ready(::core::result::Result::Err(error));
+                }
+                ::core::task::Poll::Pending => return ::core::task::Poll::Pending,
+            }
+        },
+        _ => quote! {
+            state.set_phase(#next_phase);
+        },
     }
 }
 

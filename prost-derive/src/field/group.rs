@@ -90,6 +90,31 @@ impl Field {
         }
     }
 
+    pub fn encode_async(&self, prost_path: &Path, ident: TokenStream) -> TokenStream {
+        let encode = self.encode(prost_path, ident);
+        quote! {
+            {
+                let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                let buf = &mut buf;
+                #encode
+            }
+        }
+    }
+
+    pub fn poll_encode(&self, prost_path: &Path, ident: TokenStream, index: usize) -> TokenStream {
+        let encode = self.encode(prost_path, ident);
+        quote! {
+            if state.field() == #index {
+                {
+                    let mut buf = #prost_path::transfer::AsyncEncodeTarget::buf_mut(sink);
+                    let buf = &mut buf;
+                    #encode
+                }
+                state.advance_field();
+            }
+        }
+    }
+
     pub fn merge(&self, prost_path: &Path, ident: TokenStream) -> TokenStream {
         match self.label {
             Label::Optional => quote! {

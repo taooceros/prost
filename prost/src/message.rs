@@ -4,10 +4,12 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use bytes::{Buf, BufMut};
+use core::task::{Context, Poll};
 
 use crate::encoding::varint::{encode_varint, encoded_len_varint};
 use crate::encoding::wire_type::WireType;
 use crate::encoding::{decode_key, message, DecodeContext};
+use crate::transfer::{AsyncEncodeTarget, EncodeRawAsync, PollEncodeState};
 use crate::DecodeError;
 use crate::EncodeError;
 
@@ -22,6 +24,43 @@ pub trait Message: Send + Sync {
     fn encode_raw(&self, buf: &mut impl BufMut)
     where
         Self: Sized;
+
+    /// Polls message-body encoding into an asynchronous encode target.
+    ///
+    /// The default implementation delegates to [`Message::encode_raw`]. Derived
+    /// messages override this method so `string` and `bytes` payload copies can
+    /// suspend while the rest of the protobuf structure remains CPU-encoded.
+    #[doc(hidden)]
+    fn poll_encode_raw<S>(
+        &self,
+        target: &mut S,
+        state: &mut PollEncodeState<S>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), S::Error>>
+    where
+        Self: Sized,
+        S: AsyncEncodeTarget + Send,
+    {
+        if state.field() == 0 {
+            let mut buf = target.buf_mut();
+            self.encode_raw(&mut buf);
+        }
+        state.clear();
+        Poll::Ready(Ok(()))
+    }
+
+    /// Encodes the message body to an asynchronous encode target.
+    ///
+    /// This future-shaped adapter drives [`Message::poll_encode_raw`] for code
+    /// that already owns an async encode boundary.
+    #[doc(hidden)]
+    fn encode_raw_async<'a, S>(&'a self, target: &'a mut S) -> EncodeRawAsync<'a, Self, S>
+    where
+        Self: Sized + 'a,
+        S: AsyncEncodeTarget + Send + 'a,
+    {
+        EncodeRawAsync::new(self, target)
+    }
 
     /// Decodes a field from a buffer, and merges it into `self`.
     ///
@@ -159,6 +198,18 @@ where
 {
     fn encode_raw(&self, buf: &mut impl BufMut) {
         (**self).encode_raw(buf)
+    }
+    fn poll_encode_raw<S>(
+        &self,
+        target: &mut S,
+        state: &mut PollEncodeState<S>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), S::Error>>
+    where
+        Self: Sized,
+        S: AsyncEncodeTarget + Send,
+    {
+        (**self).poll_encode_raw(target, state, cx)
     }
     fn merge_field(
         &mut self,

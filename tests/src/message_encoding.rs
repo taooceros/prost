@@ -6,7 +6,9 @@ use prost::alloc::vec;
 #[cfg(not(feature = "std"))]
 use prost::alloc::{borrow::ToOwned, string::String, vec::Vec};
 
-use prost::bytes::Bytes;
+use prost::bytes::{BufMut, Bytes};
+#[cfg(feature = "std")]
+use prost::transfer::{AsyncEncodeRefExt as _, AsyncEncodeTarget, EncodePayload};
 use prost::{Enumeration, Message, Oneof};
 
 use crate::check_message;
@@ -18,6 +20,14 @@ pub struct RepeatedFloats {
     pub single_float: f32,
     #[prost(float, repeated, packed = "true", tag = "41")]
     pub repeated_float: Vec<f32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AsyncScalarOnly {
+    #[prost(int32, tag = "1")]
+    pub int32: i32,
+    #[prost(bool, repeated, packed = "false", tag = "2")]
+    pub bools: Vec<bool>,
 }
 
 #[test]
@@ -400,6 +410,66 @@ pub enum BasicOneof {
     String(String),
 }
 
+#[cfg(feature = "std")]
+#[derive(Clone, PartialEq, Message)]
+pub struct AsyncPayloadNested {
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(bytes = "vec", tag = "3")]
+    pub payload: Vec<u8>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Clone, PartialEq, Message)]
+pub struct AsyncPayloadE2e {
+    #[prost(int32, tag = "1")]
+    pub scalar: i32,
+    #[prost(bool, repeated, packed = "false", tag = "2")]
+    pub flags: Vec<bool>,
+    #[prost(string, tag = "3")]
+    pub name: String,
+    #[prost(bytes = "vec", tag = "4")]
+    pub payload: Vec<u8>,
+    #[prost(string, repeated, tag = "5")]
+    pub repeated_names: Vec<String>,
+    #[prost(bytes = "vec", repeated, tag = "6")]
+    pub repeated_payloads: Vec<Vec<u8>>,
+    #[prost(map = "string, string", tag = "7")]
+    pub string_map: HashMap<String, String>,
+    #[prost(map = "string, bytes", tag = "8")]
+    pub bytes_map: HashMap<String, Vec<u8>>,
+    #[prost(message, optional, tag = "9")]
+    pub nested: Option<AsyncPayloadNested>,
+    #[prost(message, repeated, tag = "10")]
+    pub repeated_nested: Vec<AsyncPayloadNested>,
+    #[prost(map = "string, message", tag = "11")]
+    pub nested_map: HashMap<String, AsyncPayloadNested>,
+    #[prost(oneof = "AsyncPayloadOneof", tags = "12, 13")]
+    pub payload_oneof: Option<AsyncPayloadOneof>,
+    #[prost(oneof = "AsyncNestedOneof", tags = "14, 15")]
+    pub nested_oneof: Option<AsyncNestedOneof>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Clone, PartialEq, Oneof)]
+pub enum AsyncPayloadOneof {
+    #[prost(bytes = "vec", tag = "12")]
+    Payload(Vec<u8>),
+    #[prost(string, tag = "13")]
+    Text(String),
+}
+
+#[cfg(feature = "std")]
+#[derive(Clone, PartialEq, Oneof)]
+pub enum AsyncNestedOneof {
+    #[prost(message, tag = "14")]
+    Nested(AsyncPayloadNested),
+    #[prost(string, tag = "15")]
+    Text(String),
+}
+
 #[test]
 fn roundtrip() {
     let basic = Basic {
@@ -431,4 +501,448 @@ fn roundtrip() {
         message_btree_map: BTreeMap::from([(3, basic.clone()), (4, basic.clone())]),
     };
     check_message(&msg);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn async_encode_generated_string_bytes_matches_sync() {
+    let scalar = ScalarTypes {
+        string: "plain string payload".to_owned(),
+        bytes_vec: b"plain vec bytes".to_vec(),
+        bytes_buf: Bytes::from_static(b"plain Bytes payload"),
+        required_string: "required string payload".to_owned(),
+        required_bytes_vec: b"required vec bytes".to_vec(),
+        required_bytes_buf: Bytes::from_static(b"required Bytes payload"),
+        optional_string: Some("optional string payload".to_owned()),
+        optional_bytes_vec: Some(b"optional vec bytes".to_vec()),
+        optional_bytes_buf: Some(Bytes::from_static(b"optional Bytes payload")),
+        repeated_string: vec![
+            "repeated string a".to_owned(),
+            "repeated string b".to_owned(),
+        ],
+        repeated_bytes_vec: vec![b"repeated vec a".to_vec(), b"repeated vec b".to_vec()],
+        repeated_bytes_buf: vec![
+            Bytes::from_static(b"repeated Bytes a"),
+            Bytes::from_static(b"repeated Bytes b"),
+        ],
+        packed_string: vec![
+            "packed-name string a".to_owned(),
+            "packed-name string b".to_owned(),
+        ],
+        packed_bytes_vec: vec![b"packed-name vec a".to_vec(), b"packed-name vec b".to_vec()],
+        packed_bytes_buf: vec![
+            Bytes::from_static(b"packed-name Bytes a"),
+            Bytes::from_static(b"packed-name Bytes b"),
+        ],
+        ..Default::default()
+    };
+    assert_async_encode_matches_sync(&scalar);
+
+    let basic = Basic {
+        int32: 123,
+        bools: Vec::from([true, false, true]),
+        string: "nested string".into(),
+        optional_string: Some("nested optional string".into()),
+        enumeration: BasicEnumeration::TWO as i32,
+        enumeration_map: HashMap::from([(1, BasicEnumeration::ONE as i32)]),
+        string_map: HashMap::from([("hash key".into(), "hash value".into())]),
+        enumeration_btree_map: BTreeMap::from([(5, BasicEnumeration::THREE as i32)]),
+        string_btree_map: BTreeMap::from([
+            ("btree key a".into(), "btree value a".into()),
+            ("btree key b".into(), "btree value b".into()),
+        ]),
+        oneof: Some(BasicOneof::String("oneof string payload".into())),
+        bytes_map: HashMap::from([("bytes key".into(), b"bytes map value".to_vec())]),
+    };
+    assert_async_encode_matches_sync(&basic);
+
+    let compound = Compound {
+        optional_message: Some(basic.clone()),
+        required_message: basic.clone(),
+        repeated_message: Vec::from([basic.clone(), basic.clone()]),
+        message_map: HashMap::from([(1, basic.clone())]),
+        message_btree_map: BTreeMap::from([(2, basic)]),
+    };
+    assert_async_encode_matches_sync(&compound);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn async_encode_scalar_only_is_ready_with_pending_target() {
+    let message = AsyncScalarOnly {
+        int32: 42,
+        bools: Vec::from([true, false, true]),
+    };
+
+    let mut expected = Vec::with_capacity(message.encoded_len());
+    message.encode(&mut expected).expect("sync encode succeeds");
+
+    let mut actual = Vec::with_capacity(message.encoded_len());
+    let mut target = PendingOnceTarget::new(&mut actual);
+    let (result, pending_polls) = poll_until_ready(message.encode_async_ref(&mut target));
+    result.expect("async encode succeeds");
+
+    assert_eq!(pending_polls, 0);
+    assert_eq!(target.pending_payloads, 0);
+    assert_eq!(actual, expected);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn async_encode_pending_resume_plain_payloads_match_sync() {
+    let message = ScalarTypes {
+        string: "plain string payload".to_owned(),
+        bytes_vec: b"plain vec bytes".to_vec(),
+        bytes_buf: Bytes::from_static(b"plain Bytes payload"),
+        required_string: "required string payload".to_owned(),
+        required_bytes_vec: b"required vec bytes".to_vec(),
+        required_bytes_buf: Bytes::from_static(b"required Bytes payload"),
+        optional_string: Some("optional string payload".to_owned()),
+        optional_bytes_vec: Some(b"optional vec bytes".to_vec()),
+        optional_bytes_buf: Some(Bytes::from_static(b"optional Bytes payload")),
+        ..Default::default()
+    };
+
+    let pending_polls = assert_pending_async_encode_matches_sync(&message);
+    assert_eq!(pending_polls, 9);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn async_encode_pending_resume_repeated_payloads_match_sync() {
+    let message = ScalarTypes {
+        repeated_string: vec![
+            "repeated string a".to_owned(),
+            "repeated string b".to_owned(),
+            "repeated string c".to_owned(),
+        ],
+        repeated_bytes_vec: vec![b"repeated vec a".to_vec(), b"repeated vec b".to_vec()],
+        repeated_bytes_buf: vec![
+            Bytes::from_static(b"repeated Bytes a"),
+            Bytes::from_static(b"repeated Bytes b"),
+        ],
+        ..Default::default()
+    };
+
+    let pending_polls = assert_pending_async_encode_matches_sync(&message);
+    assert_eq!(pending_polls, 10);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn async_encode_pending_resume_maps_match_sync() {
+    let message = Basic {
+        string_btree_map: BTreeMap::from([
+            ("btree key a".into(), "btree value a".into()),
+            ("btree key b".into(), "btree value b".into()),
+        ]),
+        bytes_map: HashMap::from([("bytes key".into(), b"bytes map value".to_vec())]),
+        ..Default::default()
+    };
+
+    let pending_polls = assert_pending_async_encode_matches_sync(&message);
+    assert_eq!(pending_polls, 6);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn async_encode_pending_resume_nested_messages_match_sync() {
+    let basic = Basic {
+        int32: 123,
+        bools: Vec::from([true, false, true]),
+        string: "nested string".into(),
+        optional_string: Some("nested optional string".into()),
+        enumeration: BasicEnumeration::TWO as i32,
+        enumeration_map: HashMap::from([(1, BasicEnumeration::ONE as i32)]),
+        string_map: HashMap::from([("hash key".into(), "hash value".into())]),
+        enumeration_btree_map: BTreeMap::from([(5, BasicEnumeration::THREE as i32)]),
+        string_btree_map: BTreeMap::from([
+            ("btree key a".into(), "btree value a".into()),
+            ("btree key b".into(), "btree value b".into()),
+        ]),
+        oneof: Some(BasicOneof::String("oneof string payload".into())),
+        bytes_map: HashMap::from([("bytes key".into(), b"bytes map value".to_vec())]),
+    };
+    let message = Compound {
+        optional_message: Some(basic.clone()),
+        required_message: basic.clone(),
+        repeated_message: Vec::from([basic.clone(), basic.clone()]),
+        message_map: HashMap::from([(1, basic.clone())]),
+        message_btree_map: BTreeMap::from([(2, basic)]),
+    };
+
+    let pending_polls = assert_pending_async_encode_matches_sync(&message);
+    assert!(pending_polls > 20);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn async_encode_e2e_fake_offload_resume_matches_sync_and_decodes() {
+    let nested_a = AsyncPayloadNested {
+        id: 7,
+        name: "nested-a".into(),
+        payload: b"nested-a payload".to_vec(),
+    };
+    let nested_b = AsyncPayloadNested {
+        id: 8,
+        name: "nested-b".into(),
+        payload: b"nested-b payload".to_vec(),
+    };
+    let nested_c = AsyncPayloadNested {
+        id: 9,
+        name: "nested-c".into(),
+        payload: b"nested-c payload".to_vec(),
+    };
+    let message = AsyncPayloadE2e {
+        scalar: 99,
+        flags: Vec::from([true, false, true]),
+        name: "root name payload".into(),
+        payload: b"root bytes payload".to_vec(),
+        repeated_names: Vec::from(["repeat-a".into(), "repeat-b".into(), "repeat-c".into()]),
+        repeated_payloads: Vec::from([
+            b"repeated bytes a".to_vec(),
+            b"repeated bytes b".to_vec(),
+            b"repeated bytes c".to_vec(),
+        ]),
+        string_map: HashMap::from([
+            ("string-map-key-a".into(), "string-map-value-a".into()),
+            ("string-map-key-b".into(), "string-map-value-b".into()),
+        ]),
+        bytes_map: HashMap::from([
+            ("bytes-map-key-a".into(), b"bytes-map-value-a".to_vec()),
+            ("bytes-map-key-b".into(), b"bytes-map-value-b".to_vec()),
+        ]),
+        nested: Some(nested_a.clone()),
+        repeated_nested: Vec::from([nested_a.clone(), nested_b.clone()]),
+        nested_map: HashMap::from([
+            ("nested-map-key-a".into(), nested_b.clone()),
+            ("nested-map-key-b".into(), nested_c.clone()),
+        ]),
+        payload_oneof: Some(AsyncPayloadOneof::Payload(b"oneof bytes payload".to_vec())),
+        nested_oneof: Some(AsyncNestedOneof::Nested(nested_c)),
+    };
+
+    let mut expected = Vec::with_capacity(message.encoded_len());
+    message.encode(&mut expected).expect("sync encode succeeds");
+
+    let mut actual = Vec::with_capacity(message.encoded_len());
+    let mut target = FakeDsaTarget::new(&mut actual);
+    let (result, pending_polls) = poll_until_ready(message.encode_async_ref(&mut target));
+    result.expect("fake DSA async encode succeeds");
+
+    assert_eq!(pending_polls, target.pending_payloads);
+    assert_eq!(target.pending_payloads, target.completed_payloads);
+    assert!(target.pending_payloads > 20);
+    assert_eq!(actual, expected);
+
+    let decoded = AsyncPayloadE2e::decode(actual.as_slice()).expect("async bytes decode");
+    assert!(decoded == message);
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, PartialEq, Eq)]
+enum FakeDsaError {
+    Encode(prost::EncodeError),
+    ResumePayloadChanged { expected: Vec<u8>, actual: Vec<u8> },
+}
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct FakeDsaPayloadState {
+    staged: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "std")]
+struct FakeDsaTarget<'a> {
+    buf: &'a mut Vec<u8>,
+    pending_payloads: usize,
+    completed_payloads: usize,
+}
+
+#[cfg(feature = "std")]
+impl<'a> FakeDsaTarget<'a> {
+    fn new(buf: &'a mut Vec<u8>) -> Self {
+        Self {
+            buf,
+            pending_payloads: 0,
+            completed_payloads: 0,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsyncEncodeTarget for FakeDsaTarget<'_> {
+    type Error = FakeDsaError;
+
+    type BufMut<'a>
+        = &'a mut Vec<u8>
+    where
+        Self: 'a;
+
+    type PayloadState = FakeDsaPayloadState;
+
+    fn encode_error(error: prost::EncodeError) -> Self::Error {
+        FakeDsaError::Encode(error)
+    }
+
+    fn buf_mut(&mut self) -> Self::BufMut<'_> {
+        self.buf
+    }
+
+    fn poll_write_payload(
+        &mut self,
+        payload: EncodePayload<'_>,
+        state: core::pin::Pin<&mut Self::PayloadState>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), Self::Error>> {
+        let payload = payload.as_bytes();
+        let state = state.get_mut();
+        if let Some(staged) = state.staged.take() {
+            if staged.as_slice() != payload {
+                return core::task::Poll::Ready(Err(FakeDsaError::ResumePayloadChanged {
+                    expected: staged,
+                    actual: payload.to_vec(),
+                }));
+            }
+
+            self.buf.put_slice(&staged);
+            self.completed_payloads += 1;
+            return core::task::Poll::Ready(Ok(()));
+        }
+
+        state.staged = Some(payload.to_vec());
+        self.pending_payloads += 1;
+        cx.waker().wake_by_ref();
+        core::task::Poll::Pending
+    }
+}
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct PendingPayloadState {
+    returned_pending: bool,
+}
+
+#[cfg(feature = "std")]
+struct PendingOnceTarget<'a> {
+    buf: &'a mut Vec<u8>,
+    pending_payloads: usize,
+    completed_payloads: usize,
+}
+
+#[cfg(feature = "std")]
+impl<'a> PendingOnceTarget<'a> {
+    fn new(buf: &'a mut Vec<u8>) -> Self {
+        Self {
+            buf,
+            pending_payloads: 0,
+            completed_payloads: 0,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsyncEncodeTarget for PendingOnceTarget<'_> {
+    type Error = prost::EncodeError;
+
+    type BufMut<'a>
+        = &'a mut Vec<u8>
+    where
+        Self: 'a;
+
+    type PayloadState = PendingPayloadState;
+
+    fn encode_error(error: prost::EncodeError) -> Self::Error {
+        error
+    }
+
+    fn buf_mut(&mut self) -> Self::BufMut<'_> {
+        self.buf
+    }
+
+    fn poll_write_payload(
+        &mut self,
+        payload: EncodePayload<'_>,
+        state: core::pin::Pin<&mut Self::PayloadState>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), Self::Error>> {
+        let payload = payload.as_bytes();
+        let state = state.get_mut();
+        if !state.returned_pending {
+            state.returned_pending = true;
+            self.pending_payloads += 1;
+            cx.waker().wake_by_ref();
+            return core::task::Poll::Pending;
+        }
+
+        self.buf.put_slice(payload);
+        self.completed_payloads += 1;
+        *state = PendingPayloadState::default();
+        core::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(feature = "std")]
+fn assert_pending_async_encode_matches_sync<M>(message: &M) -> usize
+where
+    M: Message,
+{
+    let mut expected = Vec::with_capacity(message.encoded_len());
+    message.encode(&mut expected).expect("sync encode succeeds");
+
+    let mut actual = Vec::with_capacity(message.encoded_len());
+    let mut target = PendingOnceTarget::new(&mut actual);
+    let (result, pending_polls) = poll_until_ready(message.encode_async_ref(&mut target));
+    result.expect("async encode succeeds");
+
+    assert_eq!(target.pending_payloads, pending_polls);
+    assert_eq!(target.completed_payloads, target.pending_payloads);
+    assert_eq!(actual, expected);
+
+    pending_polls
+}
+
+#[cfg(feature = "std")]
+fn assert_async_encode_matches_sync<M>(message: &M)
+where
+    M: Message,
+{
+    let mut expected = Vec::with_capacity(message.encoded_len());
+    message.encode(&mut expected).expect("sync encode succeeds");
+
+    let mut actual = Vec::with_capacity(message.encoded_len());
+    {
+        let mut target = prost::transfer::BufMutEncodeTarget::new(&mut actual);
+        poll_ready(message.encode_async_ref(&mut target)).expect("async encode succeeds");
+    }
+
+    assert_eq!(actual, expected);
+}
+
+#[cfg(feature = "std")]
+fn poll_ready<F>(future: F) -> F::Output
+where
+    F: core::future::Future,
+{
+    let (output, pending_polls) = poll_until_ready(future);
+    assert_eq!(pending_polls, 0, "CPU async encode returned pending");
+    output
+}
+
+#[cfg(feature = "std")]
+fn poll_until_ready<F>(future: F) -> (F::Output, usize)
+where
+    F: core::future::Future,
+{
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut pending_polls = 0;
+
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            core::task::Poll::Ready(output) => return (output, pending_polls),
+            core::task::Poll::Pending => pending_polls += 1,
+        }
+    }
 }

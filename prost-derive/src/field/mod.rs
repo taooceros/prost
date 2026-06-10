@@ -100,6 +100,38 @@ impl Field {
         }
     }
 
+    /// Returns a statement which asynchronously encodes the field.
+    pub fn encode_async(&self, prost_path: &Path, ident: TokenStream) -> TokenStream {
+        match *self {
+            Field::Scalar(ref scalar) => scalar.encode_async(prost_path, ident),
+            Field::Message(ref message) => message.encode_async(prost_path, ident),
+            Field::Map(ref map) => map.encode_async(prost_path, ident),
+            Field::Oneof(ref oneof) => oneof.encode_async(ident),
+            Field::Group(ref group) => group.encode_async(prost_path, ident),
+        }
+    }
+
+    /// Returns a statement which poll-encodes the field.
+    pub fn poll_encode(&self, prost_path: &Path, ident: TokenStream, index: usize) -> TokenStream {
+        match *self {
+            Field::Scalar(ref scalar) => scalar.poll_encode(prost_path, ident, index),
+            Field::Message(ref message) => message.poll_encode(prost_path, ident, index),
+            Field::Map(ref map) => map.poll_encode(prost_path, ident, index),
+            Field::Oneof(ref oneof) => oneof.poll_encode(prost_path, ident, index),
+            Field::Group(ref group) => group.poll_encode(prost_path, ident, index),
+        }
+    }
+
+    pub fn needs_async_encode(&self) -> bool {
+        match *self {
+            Field::Scalar(ref scalar) => scalar.needs_async_encode(),
+            Field::Message(..) => true,
+            Field::Map(ref map) => map.needs_async_encode(),
+            Field::Oneof(..) => true,
+            Field::Group(..) => false,
+        }
+    }
+
     /// Returns an expression which evaluates to the result of merging a decoded
     /// value into the field.
     pub fn merge(&self, prost_path: &Path, ident: TokenStream) -> TokenStream {
